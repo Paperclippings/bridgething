@@ -21,6 +21,7 @@ use crate::net::WireEventBus;
 const ALS_PATH: &str = "/sys/bus/iio/devices/iio:device0/in_intensity0_raw";
 const BACKLIGHT_DIR: &str = "/sys/class/backlight/backlight";
 const ALS_PREFS_FILE: &str = "als.json";
+const DISCONNECT_DELAY: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone)]
 pub struct AlsConfig {
@@ -106,6 +107,8 @@ struct Inner {
   samples: VecDeque<u32>,
   current_ticks: u32,
   max_brightness: u32,
+  display_off: bool,
+  saved_ticks: Option<u32>,
 }
 
 impl Inner {
@@ -121,6 +124,8 @@ impl Inner {
       samples: VecDeque::with_capacity(cap),
       current_ticks,
       max_brightness,
+      display_off: false,
+      saved_ticks: None,
     }
   }
 
@@ -205,6 +210,7 @@ fn ease_step(current: u32, target: u32, ease_pct: f32) -> u32 {
 enum Cmd {
   SetMode(BrightnessMode, oneshot::Sender<Result<(), AlsError>>),
   SetLevel(f32, oneshot::Sender<Result<Result<(), HardwareError>, AlsError>>),
+  SetConnected(bool, oneshot::Sender<Result<(), AlsError>>),
 }
 
 #[derive(Debug, Clone)]
@@ -303,6 +309,50 @@ impl AlsManager {
       .map_err(|_| AlsError::Closed)?;
     reply_rx.await.map_err(|_| AlsError::Closed)?
   }
+
+  pub async fn set_connected(&self, connected: bool) -> Result<(), AlsError> {
+    let (reply_tx, reply_rx) = oneshot::channel();
+    self
+      .tx
+      .send(Cmd::SetConnected(connected, reply_tx))
+      .await
+      .map_err(|_| AlsError::Closed)?;
+    reply_rx.await.map_err(|_| AlsError::Closed)?
+  }
+
+  pub fn follow_peers(&self, mut peers: tokio::sync::watch::Receiver<crate::peer::PeerSnapshot>) -> JoinHandle<()> {
+    let manager = self.clone();
+    tokio::spawn(async move {
+      loop {
+        let connected = peers.borrow().peers.values().any(|peer| peer.has_useful_link());
+        if !connected {
+          let deadline = tokio::time::Instant::now() + DISCONNECT_DELAY;
+          loop {
+            tokio::select! {
+              _ = tokio::time::sleep_until(deadline) => break,
+              changed = peers.changed() => {
+                if changed.is_err() { return; }
+                if peers.borrow().peers.values().any(|peer| peer.has_useful_link()) {
+                  break;
+                }
+              }
+            }
+          }
+          if peers.borrow().peers.values().any(|peer| peer.has_useful_link()) {
+            continue;
+          }
+        }
+        if let Err(err) = manager.set_connected(connected).await {
+          tracing::warn!("als: connection display policy failed: {err}");
+          tokio::time::sleep(DISCONNECT_DELAY).await;
+          continue;
+        }
+        if peers.changed().await.is_err() {
+          break;
+        }
+      }
+    })
+  }
 }
 
 pub struct AlsManagerInit {
@@ -345,6 +395,43 @@ async fn run_loop(mut rx: mpsc::Receiver<Cmd>, inner: Arc<RwLock<Inner>>, bus: W
 
 async fn handle_cmd(cmd: Cmd, inner: &Arc<RwLock<Inner>>, bus: &WireEventBus) {
   match cmd {
+    Cmd::SetConnected(connected, reply) => {
+      let (ticks, dir) = {
+        let guard = inner.read().await;
+        if guard.display_off == !connected {
+          let _ = reply.send(Ok(()));
+          return;
+        }
+        let ticks = if connected {
+          if guard.mode == BrightnessMode::Manual {
+            guard.level_to_ticks(guard.manual_level)
+          } else {
+            guard.saved_ticks.unwrap_or(guard.current_ticks)
+          }
+        } else {
+          0
+        };
+        (ticks, guard.config.backlight_dir.clone())
+      };
+      if let Err(err) = write_brightness(&dir, ticks).await {
+        let _ = reply.send(Err(err));
+        return;
+      }
+      let brightness = {
+        let mut guard = inner.write().await;
+        if connected {
+          guard.display_off = false;
+          guard.saved_ticks = None;
+        } else {
+          guard.saved_ticks = Some(guard.current_ticks);
+          guard.display_off = true;
+        }
+        guard.current_ticks = ticks;
+        guard.snapshot().brightness
+      };
+      let _ = reply.send(Ok(()));
+      broadcast(bus, BridgeToClientHardwareMsg::BrightnessChanged(brightness)).await;
+    }
     Cmd::SetMode(mode, reply) => {
       let (write_ticks, dir) = {
         let guard = inner.read().await;
@@ -362,7 +449,9 @@ async fn handle_cmd(cmd: Cmd, inner: &Arc<RwLock<Inner>>, bus: &WireEventBus) {
         };
         (ticks, guard.config.backlight_dir.clone())
       };
-      if let Err(err) = write_brightness(&dir, write_ticks).await {
+      if !inner.read().await.display_off
+        && let Err(err) = write_brightness(&dir, write_ticks).await
+      {
         tracing::error!(dir = %dir.display(), ticks = write_ticks, "als: backlight write failed: {err}");
         let _ = reply.send(Err(err));
         return;
@@ -370,7 +459,9 @@ async fn handle_cmd(cmd: Cmd, inner: &Arc<RwLock<Inner>>, bus: &WireEventBus) {
       let (prefs_path, prefs, brightness) = {
         let mut guard = inner.write().await;
         guard.mode = mode;
-        guard.current_ticks = write_ticks;
+        if !guard.display_off {
+          guard.current_ticks = write_ticks;
+        }
         let prefs = BrightnessPrefs {
           mode: guard.mode,
           level: guard.manual_level,
@@ -393,6 +484,7 @@ async fn handle_cmd(cmd: Cmd, inner: &Arc<RwLock<Inner>>, bus: &WireEventBus) {
         (mismatch, ticks, guard.config.backlight_dir.clone())
       };
       if let Some(ticks) = write_ticks
+        && !inner.read().await.display_off
         && let Err(err) = write_brightness(&dir, ticks).await
       {
         tracing::error!(dir = %dir.display(), ticks, "als: backlight write failed: {err}");
@@ -402,7 +494,9 @@ async fn handle_cmd(cmd: Cmd, inner: &Arc<RwLock<Inner>>, bus: &WireEventBus) {
       let (prefs_path, prefs, brightness) = {
         let mut guard = inner.write().await;
         guard.manual_level = level;
-        if let Some(ticks) = write_ticks {
+        if let Some(ticks) = write_ticks
+          && !guard.display_off
+        {
           guard.current_ticks = ticks;
         }
         let prefs = BrightnessPrefs {
@@ -424,6 +518,9 @@ async fn handle_cmd(cmd: Cmd, inner: &Arc<RwLock<Inner>>, bus: &WireEventBus) {
 }
 
 async fn poll_once(inner: &Arc<RwLock<Inner>>, bus: &WireEventBus) -> Result<(), AlsError> {
+  if inner.read().await.display_off {
+    return Ok(());
+  }
   let als_path = inner.read().await.config.als_path.clone();
   let sample = match read_raw(&als_path).await {
     Ok(v) => v,
@@ -567,6 +664,101 @@ mod tests {
       .expect("als init tolerates absent sysfs")
       .spawn();
     (manager, loop_handle)
+  }
+
+  fn fake_backlight(root: &Path) {
+    let backlight = root.join("backlight");
+    std::fs::create_dir_all(&backlight).expect("scratch backlight");
+    std::fs::write(backlight.join("max_brightness"), "255\n").expect("max_brightness");
+    std::fs::write(backlight.join("actual_brightness"), "128\n").expect("actual_brightness");
+    std::fs::write(backlight.join("brightness"), "128\n").expect("brightness");
+  }
+
+  fn panel_ticks(root: &Path) -> u32 {
+    std::fs::read_to_string(root.join("backlight/brightness"))
+      .expect("panel brightness")
+      .trim()
+      .parse()
+      .expect("panel ticks")
+  }
+
+  #[tokio::test]
+  async fn disconnect_preserves_manual_brightness_across_repeated_events() {
+    let root = scratch("als-test-disconnect-manual");
+    fake_backlight(&root);
+    let (manager, _rig) = manager_at(&root).await;
+    manager.set_mode(BrightnessMode::Manual).await.expect("manual mode");
+    manager
+      .set_level(0.42)
+      .await
+      .expect("level write")
+      .expect("manual level");
+    let saved_prefs = std::fs::read(root.join("als.json")).expect("saved prefs");
+
+    manager.set_connected(false).await.expect("disconnect");
+    assert_eq!(panel_ticks(&root), 0);
+    manager.set_connected(false).await.expect("repeated disconnect");
+    assert_eq!(std::fs::read(root.join("als.json")).expect("saved prefs"), saved_prefs);
+    assert_eq!(manager.snapshot().await.brightness.level, 0.42);
+
+    manager.set_connected(true).await.expect("reconnect");
+    assert_eq!(panel_ticks(&root), 107);
+    assert_eq!(manager.snapshot().await.brightness.mode, BrightnessMode::Manual);
+  }
+
+  #[tokio::test]
+  async fn disconnect_from_auto_restores_auto_without_saving_zero() {
+    let root = scratch("als-test-disconnect-auto");
+    fake_backlight(&root);
+    let (manager, _rig) = manager_at(&root).await;
+    assert_eq!(manager.snapshot().await.brightness.mode, BrightnessMode::Auto);
+
+    manager.set_connected(false).await.expect("disconnected at startup");
+    assert_eq!(panel_ticks(&root), 0);
+    manager.set_connected(false).await.expect("repeated disconnect");
+    manager.set_connected(true).await.expect("reconnect");
+    assert_eq!(panel_ticks(&root), 128);
+    assert_eq!(manager.snapshot().await.brightness.mode, BrightnessMode::Auto);
+    assert!(
+      !root.join("als.json").exists(),
+      "temporary zero must not save preferences"
+    );
+  }
+
+  #[tokio::test]
+  async fn peer_watch_turns_off_at_boot_and_restores_on_reconnect() {
+    use libbridgething::{Device, DeviceType, LinkKind, Peer, PeerIap2Status};
+
+    let root = scratch("als-test-peer-watch");
+    fake_backlight(&root);
+    let (manager, _rig) = manager_at(&root).await;
+    let (tx, rx) = tokio::sync::watch::channel(crate::peer::PeerSnapshot::default());
+    let _watch = manager.follow_peers(rx);
+
+    tokio::time::sleep(DISCONNECT_DELAY + Duration::from_millis(100)).await;
+    assert_eq!(panel_ticks(&root), 0, "no peer at startup turns the display off");
+
+    let mut peer = Peer::new(Device {
+      name: "phone".into(),
+      device_type: DeviceType::Unknown,
+      id: "00:00:00:00:00:01".into(),
+      kind: LinkKind::Bluetooth,
+      default: false,
+    });
+    peer.iap2 = PeerIap2Status::Identified;
+    let mut snapshot = crate::peer::PeerSnapshot::default();
+    snapshot
+      .peers
+      .insert(crate::bluetooth::Address::from([0, 0, 0, 0, 0, 1]), peer);
+    tx.send(snapshot).expect("peer snapshot");
+    tokio::time::timeout(Duration::from_secs(1), async {
+      while panel_ticks(&root) == 0 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+      }
+    })
+    .await
+    .expect("reconnect restores display promptly");
+    assert_eq!(panel_ticks(&root), 128);
   }
 
   #[tokio::test]

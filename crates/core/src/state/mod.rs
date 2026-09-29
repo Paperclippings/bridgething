@@ -96,6 +96,7 @@ pub struct AppState {
   _asset_cache_handle: JoinHandle<()>,
   _transfer_handle: JoinHandle<()>,
   _als_handle: JoinHandle<()>,
+  _display_handle: JoinHandle<()>,
   _mic_handle: JoinHandle<()>,
 }
 
@@ -136,6 +137,7 @@ impl AppState {
       asset_cache_handle,
       transfer_handle,
       als_handle,
+      display_handle,
       mic_handle,
     } = parts;
     Arc::new(Self {
@@ -177,6 +179,7 @@ impl AppState {
       _asset_cache_handle: asset_cache_handle,
       _transfer_handle: transfer_handle,
       _als_handle: als_handle,
+      _display_handle: display_handle,
       _mic_handle: mic_handle,
     })
   }
@@ -370,6 +373,7 @@ pub struct StateAssembly {
   pub asset_cache_handle: JoinHandle<()>,
   pub transfer_handle: JoinHandle<()>,
   pub als_handle: JoinHandle<()>,
+  pub display_handle: JoinHandle<()>,
   pub mic_handle: JoinHandle<()>,
 }
 

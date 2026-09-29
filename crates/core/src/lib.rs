@@ -239,6 +239,7 @@ pub async fn init(config: DaemonConfig) -> Daemon {
     .await
     .expect("failed to initialize ALS manager")
     .spawn();
+  let display_handle = als.follow_peers(peers.watch_snapshot());
   let (mic, mic_handle) = MicManager::init(bus.clone(), bluetooth.clone(), MicConfig::default())
     .await
     .spawn();
@@ -338,6 +339,7 @@ pub async fn init(config: DaemonConfig) -> Daemon {
     asset_cache_handle,
     transfer_handle,
     als_handle,
+    display_handle,
     mic_handle,
   });
 
